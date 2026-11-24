@@ -1,0 +1,275 @@
+---
+title: "Person 2: Exploratory Data Analysis and Decision Trees"
+author: "Person 2"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+    fig_width: 7
+    fig_height: 4.5
+fontsize: 11pt
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center", out.width = "90%")
+
+needed <- c("ggplot2", "rpart", "rpart.plot", "pROC", "knitr")
+missing <- needed[!vapply(needed, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing) > 0) {
+  install.packages(missing, repos = "https://cloud.r-project.org")
+}
+
+invisible(lapply(needed, library, character.only = TRUE))
+set.seed(2026)
+```
+
+# Person 2 responsibilities
+
+This section presents the work for **Person 2: Exploratory Data Analysis & Decision Trees**:
+
+- explore relationships between employee characteristics and attrition;
+- create plots and visualizations;
+- build a classification tree;
+- prune the tree using cross-validation; and
+- prepare an interpretable tree rule for the presentation.
+
+# Data and cleaning
+
+```{r read-data}
+url <- paste0("https://raw.githubusercontent.com/IBM/",
+              "employee-attrition-aif360/master/data/emp_attrition.csv")
+d <- read.csv(url, stringsAsFactors = FALSE)
+names(d)[1] <- "Age"
+
+constant_cols <- names(d)[vapply(d, function(x) {
+  length(unique(x[!is.na(x)])) <= 1
+}, logical(1))]
+
+cat("Constant columns:\n")
+print(constant_cols)
+
+identifier_cols <- "EmployeeNumber"
+d <- d[, !(names(d) %in% c(constant_cols, identifier_cols)), drop = FALSE]
+
+d$Attrition <- factor(d$Attrition, levels = c("No", "Yes"))
+character_cols <- vapply(d, is.character, logical(1))
+d[character_cols] <- lapply(d[character_cols], factor)
+
+cat("Clean dimensions:", nrow(d), "rows and", ncol(d), "columns\n")
+cat("Duplicate rows:", sum(duplicated(d)), "\n")
+cat("Missing values:", sum(is.na(d)), "\n")
+```
+
+The data contain 1,470 employees. `EmployeeCount`, `Over18`, and `StandardHours` are constant and `EmployeeNumber` is an identifier, so each is removed. There are 237 leavers (16.1%) and 1,233 employees who remain (83.9%).
+
+# Exploratory data analysis
+
+## Overtime and attrition
+
+```{r overtime, fig.cap="Overtime employees have a larger proportion of attrition."}
+ggplot(d, aes(x = OverTime, fill = Attrition)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Attrition by Overtime",
+       x = "Works overtime", y = "Within-group proportion") +
+  scale_fill_manual(values = c("No" = "#56B4E9", "Yes" = "#E69F00"))
+
+round(prop.table(table(d$OverTime, d$Attrition), margin = 1), 3)
+```
+
+Overtime is strongly associated with a higher attrition proportion. The percentages are within each overtime category, so the plot is not affected by one category containing fewer employees.
+
+## Tenure and attrition
+
+```{r tenure, fig.cap="The proportion of leavers is highest in selected early-tenure bands."}
+d$TenureBand <- cut(d$YearsAtCompany,
+                    breaks = c(-1, 2, 5, 10, 20, Inf),
+                    labels = c("0-2", "3-5", "6-10", "11-20", "20+"))
+
+ggplot(d, aes(x = TenureBand, fill = Attrition)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Attrition by Years at Company",
+       x = "Tenure band (years)", y = "Within-band proportion") +
+  scale_fill_manual(values = c("No" = "#56B4E9", "Yes" = "#E69F00"))
+
+round(prop.table(table(d$TenureBand, d$Attrition), margin = 1), 3)
+```
+
+The early-tenure band has a relatively high proportion of leavers. This is a pattern for further investigation, not a statement that tenure causes employees to leave.
+
+## Satisfaction and work-life balance
+
+```{r satisfaction, fig.height=7, fig.cap="Job satisfaction and work-life balance vary with the attrition proportion."}
+p1 <- ggplot(d, aes(x = factor(JobSatisfaction), fill = Attrition)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Attrition by Job Satisfaction",
+       x = "Job satisfaction rating", y = "Within-rating proportion") +
+  scale_fill_manual(values = c("No" = "#56B4E9", "Yes" = "#E69F00"))
+
+p2 <- ggplot(d, aes(x = factor(WorkLifeBalance), fill = Attrition)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Attrition by Work-Life Balance",
+       x = "Work-life balance rating", y = "Within-rating proportion") +
+  scale_fill_manual(values = c("No" = "#56B4E9", "Yes" = "#E69F00"))
+
+if (requireNamespace("gridExtra", quietly = TRUE)) {
+  gridExtra::grid.arrange(p1, p2, ncol = 1)
+} else {
+  print(p1)
+  print(p2)
+}
+```
+
+The satisfaction plots provide additional context. They should not be interpreted alone because predictors may be correlated; the classification tree tests their usefulness after considering other variables.
+
+# Training and test split
+
+```{r split}
+yes_idx <- which(d$Attrition == "Yes")
+no_idx  <- which(d$Attrition == "No")
+
+test_yes <- sample(yes_idx, floor(0.30 * length(yes_idx)))
+test_no  <- sample(no_idx, floor(0.30 * length(no_idx)))
+test_idx <- c(test_yes, test_no)
+
+train <- d[-test_idx, ]
+test  <- d[test_idx, ]
+train$TenureBand <- NULL
+test$TenureBand <- NULL
+
+cat("Training:", nrow(train), "employees\n")
+cat("Test:", nrow(test), "employees\n")
+cat("Training proportions:\n")
+round(prop.table(table(train$Attrition)), 3)
+cat("Test proportions:\n")
+round(prop.table(table(test$Attrition)), 3)
+```
+
+The split is stratified by `Attrition`: 70% of the employees train the model and 30% test it. `TenureBand` is not included as a predictor because `YearsAtCompany` already provides the original continuous information.
+
+# Full classification tree
+
+```{r full-tree}
+full_tree <- rpart(Attrition ~ ., data = train, method = "class",
+                   control = rpart.control(cp = 0, minsplit = 20,
+                                           minbucket = 10, xval = 10))
+
+cat("Full tree nodes:", nrow(full_tree$frame), "\n")
+cat("Full tree leaves:", sum(full_tree$frame$var == "<leaf>"), "\n")
+
+full_prob <- predict(full_tree, test, type = "prob")[, "Yes"]
+full_pred <- factor(ifelse(full_prob >= 0.50, "Yes", "No"),
+                    levels = c("No", "Yes"))
+```
+
+The full tree uses a complexity parameter of zero, so it keeps nearly every split until the minimum-node constraints stop growth. Training error is not sufficient for selecting this tree because it can keep falling as the tree becomes more complex.
+
+# Pruning the tree
+
+```{r pruning}
+cp_table <- full_tree$cptable
+round(cp_table, 4)
+
+minimum_row <- which.min(cp_table[, "xerror"])
+minimum_error <- cp_table[minimum_row, "xerror"]
+minimum_se <- cp_table[minimum_row, "xstd"]
+eligible_rows <- which(cp_table[, "xerror"] <= minimum_error + minimum_se)
+chosen_row <- eligible_rows[1]
+chosen_cp <- cp_table[chosen_row, "CP"]
+
+cat("Minimum cross-validation error:", round(minimum_error, 4), "\n")
+cat("One-standard-error threshold:", round(minimum_error + minimum_se, 4), "\n")
+cat("Chosen complexity parameter:", chosen_cp, "\n")
+
+pruned_tree <- prune(full_tree, cp = chosen_cp)
+
+cat("Pruned tree nodes:", nrow(pruned_tree$frame), "\n")
+cat("Pruned tree leaves:", sum(pruned_tree$frame$var == "<leaf>"), "\n")
+
+pruned_prob <- predict(pruned_tree, test, type = "prob")[, "Yes"]
+pruned_pred <- factor(ifelse(pruned_prob >= 0.50, "Yes", "No"),
+                      levels = c("No", "Yes"))
+
+rpart.plot(pruned_tree, extra = 104, box.palette = "-RdBu",
+           main = "Pruned Decision Tree")
+```
+
+Pruning uses the 1-standard-error rule. The selected tree is the simplest tree whose cross-validation error is within one standard error of the minimum. This normally reduces variance and improves the stability of the rule, while accepting more training error.
+
+# Interpret the pruned tree
+
+```{r tree-rules}
+print(pruned_tree, compress = TRUE)
+```
+
+Read the tree from the top node downward. At each split, follow the left or right branch according to whether the employee satisfies the displayed condition. The final leaf gives the predicted attrition class and its leave probability.
+
+To prepare the presentation slide, state the rule in plain language, for example:
+
+> **If an employee meets the conditions shown at the top split, follow the corresponding branches. The leaf then gives the employee's predicted outcome and the estimated proportion of leavers in that leaf.**
+
+# Full-tree and pruned-tree comparison
+
+```{r tree-comparison}
+tree_error <- function(pred) mean(pred != test$Attrition)
+
+data.frame(
+  Tree = c("Full", "Pruned"),
+  NodesIncludingLeaves = c(nrow(full_tree$frame), nrow(pruned_tree$frame)),
+  Leaves = c(sum(full_tree$frame$var == "<leaf>"),
+             sum(pruned_tree$frame$var == "<leaf>")),
+  TestError = c(tree_error(full_pred), tree_error(pruned_pred))
+)
+```
+
+The full tree keeps adding splits and has low training error, but it can fit noise. The pruned tree has fewer rules and usually makes it easier to explain tradeoffs to HR. A test-set difference from one random split should not be treated as proof that pruning always performs better.
+
+# ROC and test-set comparison
+
+```{r tree-performance}
+cm_full <- table(Predicted = full_pred, Actual = test$Attrition)
+cm_pruned <- table(Predicted = pruned_pred, Actual = test$Attrition)
+
+metric_row <- function(name, cm, prob) {
+  tp <- cm["Yes", "Yes"]
+  tn <- cm["No", "No"]
+  fp <- cm["Yes", "No"]
+  fn <- cm["No", "Yes"]
+  roc_obj <- pROC::roc(test$Attrition, prob,
+                       levels = c("No", "Yes"), direction = "<",
+                       quiet = TRUE)
+  data.frame(Model = name,
+             Accuracy = (tp + tn) / sum(cm),
+             Sensitivity = tp / (tp + fn),
+             Specificity = tn / (tn + fp),
+             AUC = as.numeric(pROC::auc(roc_obj)))
+}
+
+comparison <- rbind(metric_row("Full tree", cm_full, full_prob),
+                    metric_row("Pruned tree", cm_pruned, pruned_prob))
+comparison[, -1] <- lapply(comparison[, -1], function(x) round(x, 3))
+kable(comparison, caption = "Person 2: test-set tree comparison")
+
+plot(pROC::roc(test$Attrition, full_prob, levels = c("No", "Yes"),
+               direction = "<", quiet = TRUE),
+     col = "#999999", lwd = 2, main = "Decision-tree ROC curves")
+plot(pROC::roc(test$Attrition, pruned_prob, levels = c("No", "Yes"),
+               direction = "<", quiet = TRUE),
+     col = "#0072B2", lwd = 2, add = TRUE)
+legend("bottomright", legend = c("Full tree", "Pruned tree"),
+       col = c("#999999", "#0072B2"), lwd = 2, bty = "n")
+```
+
+AUC measures ranking ability. For example, an AUC of 0.70 means that a randomly selected leaver has a 70% chance of receiving a higher score than a randomly selected employee who stayed.
+
+# Recommendation and limitations
+
+The pruned tree should be used for explanation: it can be read as a small set of if-then rules. It gives up some possible predictive accuracy for interpretability and stability. It should support HR review rather than make automatic employment decisions.
+
+The results are descriptive and model-based, not causal. A different random split or another data sample could change the selected splits, so Person 2's final presentation should identify the exact rule produced and state that it requires repeated-split or cross-validation confirmation.
