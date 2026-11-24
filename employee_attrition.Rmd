@@ -1,0 +1,259 @@
+---
+title: "Predicting Employee Attrition"
+author: "Group Project"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+    fig_width: 7
+    fig_height: 4.5
+fontsize: 11pt
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center", out.width = "90%")
+
+needed <- c("ggplot2", "rpart", "rpart.plot", "randomForest", "pROC", "knitr")
+missing <- needed[!vapply(needed, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing) > 0) {
+  install.packages(missing, repos = "https://cloud.r-project.org")
+}
+
+invisible(lapply(needed, library, character.only = TRUE))
+set.seed(2026)
+```
+
+# Question and intended use
+
+**Question:** Which employees are likely to leave, and which measured patterns are useful for identifying them before departure?
+
+A human-resources team could use the answer to prioritize retention conversations and targeted workplace improvements. This is a decision-support model, not an automatic employment decision.
+
+# Data and cleaning
+
+```{r read-data}
+url <- paste0("https://raw.githubusercontent.com/IBM/",
+              "employee-attrition-aif360/master/data/emp_attrition.csv")
+
+d <- read.csv(url, stringsAsFactors = FALSE)
+names(d)[1] <- "Age"
+
+cat("Original dimensions:", nrow(d), "rows and", ncol(d), "columns\n")
+
+constant_cols <- names(d)[vapply(d, function(x) {
+  length(unique(x[!is.na(x)])) <= 1
+}, logical(1))]
+constant_cols
+
+identifier_cols <- "EmployeeNumber"
+d <- d[, !(names(d) %in% c(constant_cols, identifier_cols)), drop = FALSE]
+
+cat("Duplicate rows:", sum(duplicated(d)), "\n")
+cat("Missing values:", sum(is.na(d)), "\n")
+
+d$Attrition <- factor(d$Attrition, levels = c("No", "Yes"))
+character_cols <- vapply(d, is.character, logical(1))
+d[character_cols] <- lapply(d[character_cols], factor)
+
+cat("Clean dimensions:", nrow(d), "rows and", ncol(d), "columns\n")
+```
+
+The file arrived with 1,470 records and 35 variables. I repaired the stray character in the first column name. `EmployeeCount`, `Over18`, and `StandardHours` contain one value for every record, while `EmployeeNumber` is only an identifier; all four are removed. There are no missing values. Duplicate rows are checked after the identifier and constants are removed. The positive class is `Attrition = Yes`.
+
+```{r response-summary}
+tab <- table(d$Attrition)
+tab
+prop.table(tab)
+```
+
+# Exploratory plots
+
+```{r overtime-plot, fig.cap="Attrition is more common for employees who work overtime."}
+ggplot(d, aes(x = OverTime, fill = Attrition)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Attrition by Overtime",
+       x = "Works overtime", y = "Within-group proportion") +
+  scale_fill_manual(values = c("No" = "#56B4E9", "Yes" = "#E69F00"))
+```
+
+Overtime status is strongly associated with attrition: a larger proportion of overtime employees left. This motivates including job demands and workload in the model.
+
+```{r tenure-plot, fig.cap="Attrition varies with tenure and is most visible among employees with fewer years at the company."}
+ggplot(d, aes(x = YearsAtCompany, fill = Attrition)) +
+  geom_histogram(binwidth = 2, position = "fill", boundary = 0) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Attrition by Years at Company",
+       x = "Years at the company", y = "Within-bin proportion") +
+  scale_fill_manual(values = c("No" = "#56B4E9", "Yes" = "#E69F00"))
+```
+
+The proportion leaving appears to be highest in some early-tenure ranges. This is a useful pattern, although tenure should not be interpreted as a cause.
+
+# Training and test split
+
+```{r split}
+yes_idx <- which(d$Attrition == "Yes")
+no_idx  <- which(d$Attrition == "No")
+
+test_yes <- sample(yes_idx, floor(0.30 * length(yes_idx)))
+test_no  <- sample(no_idx,  floor(0.30 * length(no_idx)))
+test_idx <- c(test_yes, test_no)
+
+train <- d[-test_idx, ]
+test  <- d[test_idx, ]
+
+cat("Training:", nrow(train), "; test:", nrow(test), "\n")
+cat("Training attrition:\n")
+print(prop.table(table(train$Attrition)))
+cat("Test attrition:\n")
+print(prop.table(table(test$Attrition)))
+```
+
+The split occurs before fitting any model. Because the response is uneven, I stratify by `Attrition` so both the training and test sets retain approximately the original class proportions.
+
+# Classification models
+
+## Full decision tree
+
+```{r full-tree}
+full_tree <- rpart(Attrition ~ ., data = train, method = "class",
+                   control = rpart.control(cp = 0, minsplit = 20,
+                                           minbucket = 10, xval = 10))
+
+cat("Full tree leaves:", length(unique(full_tree$where)), "\n")
+full_prob <- predict(full_tree, test, type = "prob")[, "Yes"]
+full_pred <- factor(ifelse(full_prob >= 0.50, "Yes", "No"),
+                    levels = c("No", "Yes"))
+```
+
+## Pruned decision tree
+
+```{r prune-tree}
+cp_table <- full_tree$cptable
+min_xerr_row <- which.min(cp_table[, "xerror"])
+min_xerr <- cp_table[min_xerr_row, "xerror"]
+se <- cp_table[min_xerr_row, "xstd"]
+eligible <- cp_table[, "xerror"] <= min_xerr + se
+prune_row <- which(eligible)[1]
+chosen_cp <- cp_table[prune_row, "CP"]
+chosen_cp
+
+pruned_tree <- prune(full_tree, cp = chosen_cp)
+pruned_prob <- predict(pruned_tree, test, type = "prob")[, "Yes"]
+pruned_pred <- factor(ifelse(pruned_prob >= 0.50, "Yes", "No"),
+                      levels = c("No", "Yes"))
+
+cat("Pruned tree leaves:", length(unique(pruned_tree$where)), "\n")
+rpart.plot(pruned_tree, extra = 104, box.palette = "-RdBu",
+           main = "Pruned decision tree")
+```
+
+The tree is pruned with the 1-standard-error rule. This favors a simpler tree whose cross-validation error is within one standard error of the minimum.
+
+## Bagging
+
+```{r bagging}
+bag_predictions <- matrix(0, nrow = nrow(test), ncol = 100)
+
+for (b in 1:100) {
+  boot_idx <- sample(seq_len(nrow(train)), nrow(train), replace = TRUE)
+  boot_train <- train[boot_idx, ]
+  bag_fit <- rpart(Attrition ~ ., data = boot_train, method = "class",
+                   control = rpart.control(cp = 0.01, minsplit = 20,
+                                           minbucket = 10))
+  bag_predictions[, b] <- predict(bag_fit, test, type = "prob")[, "Yes"]
+}
+
+bag_prob <- rowMeans(bag_predictions)
+bag_pred <- factor(ifelse(bag_prob >= 0.50, "Yes", "No"),
+                   levels = c("No", "Yes"))
+```
+
+## Random forest
+
+```{r random-forest}
+rf_fit <- randomForest(Attrition ~ ., data = train,
+                       ntree = 500, mtry = floor(sqrt(ncol(train) - 1)),
+                       importance = TRUE)
+rf_prob <- predict(rf_fit, test, type = "prob")[, "Yes"]
+rf_pred <- predict(rf_fit, test, type = "response")
+```
+
+# Performance comparison
+
+```{r roc-and-table}
+metric_row <- function(name, truth, prob, pred) {
+  cm <- table(Predicted = pred, Actual = truth)
+  tp <- cm["Yes", "Yes"]
+  tn <- cm["No", "No"]
+  fp <- cm["Yes", "No"]
+  fn <- cm["No", "Yes"]
+  roc_obj <- pROC::roc(truth, prob, levels = c("No", "Yes"),
+                       direction = "<", quiet = TRUE)
+  data.frame(
+    Model = name,
+    Accuracy = (tp + tn) / sum(cm),
+    Sensitivity = tp / (tp + fn),
+    Specificity = tn / (tn + fp),
+    PPV = tp / (tp + fp),
+    NPV = tn / (tn + fn),
+    AUC = as.numeric(pROC::auc(roc_obj)),
+    row.names = NULL
+  )
+}
+
+comparison <- rbind(
+  metric_row("Full tree", test$Attrition, full_prob, full_pred),
+  metric_row("Pruned tree", test$Attrition, pruned_prob, pruned_pred),
+  metric_row("Bagging", test$Attrition, bag_prob, bag_pred),
+  metric_row("Random forest", test$Attrition, rf_prob, rf_pred)
+)
+
+majority_outcome <- names(sort(table(test$Attrition), decreasing = TRUE))[1]
+majority_accuracy <- max(prop.table(table(test$Attrition)))
+comparison <- rbind(
+  data.frame(Model = "Majority class benchmark",
+             Accuracy = majority_accuracy,
+             Sensitivity = if (majority_outcome == "Yes") 1 else 0,
+             Specificity = if (majority_outcome == "No") 1 else 0,
+             PPV = if (majority_outcome == "Yes") majority_accuracy else 0,
+             NPV = if (majority_outcome == "No") majority_accuracy else 0,
+             AUC = 0.50),
+  comparison
+)
+
+comparison[, -1] <- lapply(comparison[, -1], function(x) round(x, 3))
+kable(comparison, caption = "Test-set comparison (0.50 probability threshold)")
+```
+
+The benchmark always predicts `No`, the more common class. It is useful because ordinary accuracy can look acceptable while failing to identify leavers. In this setting, a false negative means that a likely leaver receives no retention intervention, while a false positive means resources may be spent on an employee who would have stayed. The threshold should be reviewed against the cost of those two errors; a threshold lower than 0.50 may be appropriate if missed leavers are expensive.
+
+```{r roc-plot, fig.cap="ROC curves for the four fitted models on the test set."}
+plot(pROC::roc(test$Attrition, full_prob, levels = c("No", "Yes"),
+               direction = "<", quiet = TRUE),
+     col = "#999999", lwd = 2, main = "ROC curves")
+plot(pROC::roc(test$Attrition, pruned_prob, levels = c("No", "Yes"),
+               direction = "<", quiet = TRUE),
+     col = "#0072B2", lwd = 2, add = TRUE)
+plot(pROC::roc(test$Attrition, bag_prob, levels = c("No", "Yes"),
+               direction = "<", quiet = TRUE),
+     col = "#D55E00", lwd = 2, add = TRUE)
+plot(pROC::roc(test$Attrition, rf_prob, levels = c("No", "Yes"),
+               direction = "<", quiet = TRUE),
+     col = "#009E73", lwd = 2, add = TRUE)
+legend("bottomright", legend = c("Full tree", "Pruned tree", "Bagging", "Random forest"),
+       col = c("#999999", "#0072B2", "#D55E00", "#009E73"),
+       lwd = 2, bty = "n")
+```
+
+AUC measures the probability that a randomly selected leaver receives a higher score than a randomly selected employee who stays. A value of 0.50 means no ranking ability, while 1.00 means perfect ranking.
+
+# Recommendation and limitations
+
+Choose the model only after checking whether sensitivity or false-negative cost is the main criterion. The random forest and bagging may have similar discrimination, so a few percentage points of test accuracy should not by themselves be treated as a meaningful winner. A one-time test split is not enough to establish deployment reliability; cross-validation or repeated splits would add uncertainty estimates.
+
+Use the model to guide supportive human review, not automatic firing or denial of opportunities. Attrition is observational, so predictive relationships do not establish causation. Protected or sensitive attributes—especially `Age`, `Gender`, and `MaritalStatus`—require fairness review before operational use. A next step would be calibration and a cost-based threshold selected with HR.
