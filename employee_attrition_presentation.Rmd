@@ -1,0 +1,249 @@
+---
+title: "Employee Attrition: Who Is Likely to Leave?"
+author: "Group Project"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  powerpoint_presentation:
+    slide_level: 2
+    toc: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.align = "center", out.width = "95%")
+needed <- c("ggplot2", "rpart", "rpart.plot", "randomForest", "pROC",
+            "knitr", "scales", "gridExtra")
+missing <- needed[!vapply(needed, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing) > 0) {
+  install.packages(missing, repos = "https://cloud.r-project.org")
+}
+invisible(lapply(needed, library, character.only = TRUE))
+set.seed(2026)
+
+url <- paste0("https://raw.githubusercontent.com/IBM/",
+              "employee-attrition-aif360/master/data/emp_attrition.csv")
+d <- read.csv(url, stringsAsFactors = FALSE)
+names(d)[1] <- "Age"
+constant_cols <- names(d)[vapply(d, function(x) {
+  length(unique(x[!is.na(x)])) <= 1
+}, logical(1))]
+d <- d[, !(names(d) %in% c(constant_cols, "EmployeeNumber")), drop = FALSE]
+d$Attrition <- factor(d$Attrition, levels = c("No", "Yes"))
+character_cols <- vapply(d, is.character, logical(1))
+d[character_cols] <- lapply(d[character_cols], factor)
+```
+
+## 1. The question and who needs the answer
+
+**Which employees are more likely to leave—and what patterns can HR act on early?**
+
+- **Audience:** Human-resources leaders planning supportive retention conversations.
+- **Goal:** Identify patterns and compare models that can help prioritize review.
+- **Guardrail:** Use predictions as decision support, never as an automatic employment decision.
+
+*Presentation note: Introduce the business problem and explain that the analysis identifies associations, not causes.*
+
+## 2. The data and what needed fixing
+
+- **1,470 employees; 35 variables** in the source file.
+- **237 left (16.1%); 1,233 stayed (83.9%).**
+- The first column name needed repair (`Age`).
+- Removed constant columns: `EmployeeCount`, `Over18`, `StandardHours`.
+- Removed `EmployeeNumber`, an employee identifier.
+- No missing values were found; no employee records were dropped.
+
+*Why class balance matters: a model that always predicts “stayed” gets high accuracy but identifies no leavers.*
+
+## 3. Two patterns that support the analysis
+
+```{r eda-plots, fig.width=10, fig.height=5.5, out.width="100%"}
+d$TenureBand <- cut(d$YearsAtCompany,
+                    breaks = c(-1, 2, 5, 10, 20, Inf),
+                    labels = c("0-2", "3-5", "6-10", "11-20", "20+"))
+
+p_overtime <- ggplot(d, aes(x = OverTime, fill = Attrition)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = c("No" = "#56B4E9", "Yes" = "#E69F00")) +
+  labs(title = "Attrition by overtime", x = "Works overtime",
+       y = "Share within group", fill = "Attrition") +
+  theme_minimal(base_size = 13)
+
+p_tenure <- ggplot(d, aes(x = TenureBand, fill = Attrition)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = c("No" = "#56B4E9", "Yes" = "#E69F00")) +
+  labs(title = "Attrition by tenure", x = "Years at company",
+       y = "Share within group", fill = "Attrition") +
+  theme_minimal(base_size = 13)
+
+gridExtra::grid.arrange(p_overtime, p_tenure, ncol = 2)
+```
+
+**What to point out:** Compare the *within-group* shares, not the raw bar heights. Overtime employees and employees in some early-tenure bands show a higher share leaving. These are associations, not proof of cause.
+
+*Presentation note: Explain why proportions make comparisons fair when group sizes differ.*
+
+## 4. The pruned tree: a rule HR can read
+
+```{r make-split, include=FALSE}
+yes_idx <- which(d$Attrition == "Yes")
+no_idx <- which(d$Attrition == "No")
+test_idx <- c(sample(yes_idx, floor(0.30 * length(yes_idx))),
+               sample(no_idx, floor(0.30 * length(no_idx))))
+train <- d[-test_idx, ]
+test <- d[test_idx, ]
+train$TenureBand <- NULL
+test$TenureBand <- NULL
+
+full_tree <- rpart(Attrition ~ ., data = train, method = "class",
+                   control = rpart.control(cp = 0, minsplit = 20,
+                                           minbucket = 10, xval = 10))
+cp_table <- full_tree$cptable
+min_row <- which.min(cp_table[, "xerror"])
+eligible <- which(cp_table[, "xerror"] <=
+                    cp_table[min_row, "xerror"] + cp_table[min_row, "xstd"])
+chosen_cp <- cp_table[eligible[1], "CP"]
+pruned_tree <- prune(full_tree, cp = chosen_cp)
+
+# Choose the largest training leaf predicted as Yes for an example rule.
+frame <- pruned_tree$frame
+leaf_rows <- which(frame$var == "<leaf>" & frame$yval == 2)
+if (length(leaf_rows) > 0) {
+  selected_leaf <- as.integer(rownames(frame)[leaf_rows[which.max(frame$n[leaf_rows])]])
+  path_list <- path.rpart(pruned_tree, nodes = selected_leaf)
+  path_terms <- unlist(path_list, use.names = FALSE)
+  path_terms <- path_terms[path_terms != "root"]
+  rule_text <- if (length(path_terms)) paste(path_terms, collapse = " AND ") else
+    "Follow the highlighted Yes-predicted leaf in the plotted tree."
+} else {
+  rule_text <- "This pruned tree has no leaf predicting Yes at the default class cutoff; use its probability scores and review the decision threshold."
+}
+```
+
+```{r pruned-tree-plot, fig.width=10, fig.height=5.2, out.width="100%"}
+rpart.plot(pruned_tree, extra = 104, box.palette = "-RdBu",
+           fallen.leaves = TRUE, main = "Pruned decision tree")
+```
+
+**Example positive-leaf rule from this fitted tree:** `r rule_text`
+
+*How to read it aloud:* Start at the root, check each condition in order, and follow the matching branch to a leaf. The leaf gives the predicted class and the estimated share classified as leavers. The plotted tree is the source of the exact thresholds.
+
+*Presentation note: Read the displayed rule in ordinary language; describe this as a risk flag for supportive review, not a verdict about an employee.*
+
+## 5. Why prune the tree?
+
+```{r tree-size, include=FALSE}
+full_pred <- factor(ifelse(predict(full_tree, test, type = "prob")[, "Yes"] >= 0.50,
+                           "Yes", "No"), levels = c("No", "Yes"))
+pruned_prob <- predict(pruned_tree, test, type = "prob")[, "Yes"]
+pruned_pred <- factor(ifelse(pruned_prob >= 0.50, "Yes", "No"),
+                      levels = c("No", "Yes"))
+full_test_error <- mean(full_pred != test$Attrition)
+pruned_test_error <- mean(pruned_pred != test$Attrition)
+```
+
+- The **full tree** can keep splitting to fit details specific to its training sample.
+- **Pruning** removes splits that add little cross-validated value.
+- We used the **1-standard-error rule**: choose the simplest tree within one standard error of the minimum cross-validation error.
+- The pruned tree has **`r sum(pruned_tree$frame$var == "<leaf>")` leaves**, versus **`r sum(full_tree$frame$var == "<leaf>")`** in the full tree.
+- Test error: **full `r scales::percent(full_test_error, accuracy = 0.1)`; pruned `r scales::percent(pruned_test_error, accuracy = 0.1)`**.
+
+*Presentation note: Training error tends to fall as a tree grows, but that does not guarantee better performance on unseen employees. Test error is a more useful check of generalization.*
+
+## 6. Four-model ROC and comparison with guessing
+
+```{r fit-other-models, include=FALSE}
+# Bagging: average probabilities from bootstrap-grown trees.
+bag_predictions <- matrix(0, nrow = nrow(test), ncol = 100)
+for (b in seq_len(100)) {
+  boot_idx <- sample(seq_len(nrow(train)), nrow(train), replace = TRUE)
+  bag_fit <- rpart(Attrition ~ ., data = train[boot_idx, ], method = "class",
+                   control = rpart.control(cp = 0.01, minsplit = 20,
+                                           minbucket = 10))
+  bag_predictions[, b] <- predict(bag_fit, test, type = "prob")[, "Yes"]
+}
+bag_prob <- rowMeans(bag_predictions)
+bag_pred <- factor(ifelse(bag_prob >= 0.50, "Yes", "No"), levels = c("No", "Yes"))
+
+rf_fit <- randomForest(Attrition ~ ., data = train, ntree = 500,
+                       mtry = floor(sqrt(ncol(train) - 1)))
+rf_prob <- predict(rf_fit, test, type = "prob")[, "Yes"]
+rf_pred <- predict(rf_fit, test, type = "response")
+
+model_probs <- list("Full tree" = predict(full_tree, test, type = "prob")[, "Yes"],
+                    "Pruned tree" = pruned_prob,
+                    "Bagging" = bag_prob,
+                    "Random forest" = rf_prob)
+model_preds <- list("Full tree" = full_pred,
+                    "Pruned tree" = pruned_pred,
+                    "Bagging" = bag_pred,
+                    "Random forest" = rf_pred)
+
+make_metrics <- function(model_name, prob, pred) {
+  cm <- table(Predicted = factor(pred, levels = c("No", "Yes")),
+              Actual = factor(test$Attrition, levels = c("No", "Yes")))
+  tp <- cm["Yes", "Yes"]; tn <- cm["No", "No"]
+  fp <- cm["Yes", "No"]; fn <- cm["No", "Yes"]
+  roc_obj <- pROC::roc(test$Attrition, prob, levels = c("No", "Yes"),
+                       direction = "<", quiet = TRUE)
+  data.frame(Model = model_name,
+             Accuracy = (tp + tn) / sum(cm),
+             Sensitivity = if ((tp + fn) > 0) tp / (tp + fn) else NA_real_,
+             Specificity = if ((tn + fp) > 0) tn / (tn + fp) else NA_real_,
+             AUC = as.numeric(pROC::auc(roc_obj)))
+}
+
+comparison <- do.call(rbind, lapply(names(model_probs), function(nm) {
+  make_metrics(nm, model_probs[[nm]], model_preds[[nm]])
+}))
+majority_accuracy <- max(prop.table(table(test$Attrition)))
+comparison <- rbind(data.frame(Model = "Majority class (always No)",
+                               Accuracy = majority_accuracy,
+                               Sensitivity = 0,
+                               Specificity = 1,
+                               AUC = 0.5), comparison)
+comparison_print <- comparison
+comparison_print[, -1] <- lapply(comparison_print[, -1], function(x) round(x, 3))
+```
+
+```{r roc-and-table, fig.width=7.5, fig.height=4.5}
+roc_colors <- c("#555555", "#0072B2", "#D55E00", "#009E73")
+roc_list <- lapply(model_probs, function(prob) {
+  pROC::roc(test$Attrition, prob, levels = c("No", "Yes"),
+            direction = "<", quiet = TRUE)
+})
+plot(roc_list[[1]], col = roc_colors[1], lwd = 2,
+     main = "ROC curves on the held-out test set")
+for (i in 2:length(roc_list)) {
+  plot(roc_list[[i]], col = roc_colors[i], lwd = 2, add = TRUE)
+}
+legend("bottomright", legend = names(roc_list), col = roc_colors,
+       lwd = 2, bty = "n", cex = 0.8)
+```
+
+```{r comparison-table}
+knitr::kable(comparison_print,
+            caption = "Held-out test-set results at a 0.50 probability threshold")
+```
+
+**How to explain AUC:** It is the chance that a randomly selected leaver receives a higher risk score than a randomly selected employee who stayed. **0.50** is no better than ranking at random; higher is better.
+
+The majority-class benchmark shows why accuracy alone is not enough: always predicting “No” can be correct most of the time while having zero sensitivity for leavers. Sensitivity and the cost of missed leavers should inform the final decision threshold.
+
+*Presentation note: Compare the four ROC curves and table. Do not claim a meaningful winner when test results are close or based on one split.*
+
+## 7. Recommendation: what we recommend and what we give up
+
+**Recommendation:** Use the pruned tree as a transparent way to identify patterns for **voluntary, supportive HR follow-up**. Compare its results against bagging and random forest before selecting a model for further testing.
+
+- We gain a short, explainable rule with the tree.
+- We may give up some predictive performance compared with ensemble models.
+- The test metrics come from one random split and need confirmation with repeated splits or cross-validation.
+- Attrition predictors are associations, not proof of causes.
+- Do not use the model to make automatic hiring, firing, promotion, or compensation decisions. Review fairness and privacy before any operational use.
+
+**Questions to prepare for:** Why prune? What does AUC mean for two employees? How does the model compare with always predicting “stayed”? Which error is more costly to HR? Would the recommendation survive a different split?
+
+*Presentation note: Each group member should be ready to explain the question, data cleaning, plots, tree, and the limitations—not only their own slide.*
