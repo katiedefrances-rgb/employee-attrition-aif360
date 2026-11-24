@@ -1,0 +1,67 @@
+{\rtf1\ansi\deff0
+{\fonttbl{\f0 Calibri;}{\f1 Calibri Light;}}
+{\colortbl;\red31\green78\blue121;\red89\green89\blue89;}
+\paperw12240\paperh15840
+\margl1440\margr1440\margt1440\margb1440
+\widowctrl
+\pard\qc\b\f1\fs36 Employee Attrition Prediction Project\par
+\pard\qc\b0\f0\fs22 Group Project | Data and Modeling Report\par
+\vspace{120}\par
+
+\pard\b\f0\fs24 Executive Summary\b0\fs22\par
+This project asks which IBM HR Analytics employees are likely to leave and which measured employee characteristics identify attrition before departure. The resulting model is intended to support proactive, human-reviewed retention actions, such as a manager or HR professional checking workload, compensation, career movement, tenure, or overtime status. It should not independently determine pay, promotion, discipline, or employment status.
+
+The original data contain 1,470 employee records and 35 variables. The response, Attrition, is highly imbalanced: 237 employees (16.1%) left and 1,233 (83.9%) stayed. Data preparation removed three constant columns (EmployeeCount, Over18, and StandardHours), repaired the first column name, and removed EmployeeNumber because it is an identifier rather than a meaningful predictor. No missing values or duplicate rows were identified after these checks. Character fields were converted to factors for modeling.
+
+The analysis compared a full decision tree, a one-standard-error pruned decision tree, 100 bootstrap-bagged trees, and a random forest of 500 trees. The data were split before fitting, using a stratified 70/30 training/test split (1,029 training and 441 test observations). The test-set comparison is more informative than training accuracy because it evaluates generalization. For an employee retention problem, sensitivity (finding employees who actually leave) is particularly important, while specificity reflects the share of staying employees who are not unnecessarily flagged.
+
+
+\pard\b\f0\fs24 Question, Audience, and Intended Use\b0\fs22\par
+The decision question was: \i For an employee who appears in the available employee records, what is the estimated probability of attrition, and which patterns explain those predictions?\i0  The primary audience is an HR analytics or retention team. A useful output would be a ranked list of employees for supportive review, paired with the strongest factors that contributed to the result. However, a probability is not evidence that an employee will certainly leave or that a listed factor caused the departure.
+
+The model has a limited and appropriate use: it can identify a need for outreach or workplace review. It should not be used as a substitute for managerial judgment. It should especially not be used to decide who is fired, denied advancement, paid less, or monitored more closely. Protected characteristics and sensitive workplace attributes may encode historical inequities even if they are individually associated with attrition.
+
+
+\pard\b\f0\fs24 Data Quality and Cleaning\b0\fs22\par
+The first column label arrived with an extra character, so it was changed to Age. Three variables were constant across all records and supplied no information: EmployeeCount, Over18, and StandardHours. EmployeeNumber was a record identifier, not an employee characteristic, so it was excluded to avoid creating a meaningless pattern. The remaining 30 predictors were checked for missing values and duplicate records. There were no missing values, and no duplicate rows remained after identifier and constant-column removal.
+
+These choices matter. Removing constant columns prevents an ensemble or tree from treating zero-variation information as useful. Excluding EmployeeNumber avoids model memorization of an arbitrary label. The absence of missing values means imputation was unnecessary; if missing values had been filled later, an appropriate strategy would be estimated only on the training set to avoid leakage. Duplicate records, if present, should have been examined rather than automatically deleted: a true duplicate should be one record repeated more than once, while two employees with the same measured attributes are not duplicates unless all identifying evidence confirms repetition.
+
+
+\pard\b\f0\fs24 Exploratory Findings\b0\fs22\par
+The first plot compares the proportion of employees who left and stayed within overtime groups. The plot shows that attrition is more common among employees who work overtime, with the within-group proportion leaving visibly higher for the overtime category. This motivates attention to workload and hours, but it does not establish that overtime causes turnover.
+
+The second plot examines the proportion leaving by years at the company. Attrition is most visible in several early-tenure ranges and then appears less frequent as tenure increases. The pattern is useful for identifying potentially vulnerable employees, although an employee's tenure does not determine their decision to leave. The plots make the class imbalance visible only indirectly: in many tenure and overtime bins, the stayed class remains the larger share.
+
+
+\pard\b\f0\fs24 Modeling Strategy and Results\b0\fs22\par
+A stratified holdout split was used before fitting. Stratification preserves approximately the original attrition proportion in training and test sets while avoiding a test set made too small in the positive class. Sampling 30% of each outcome category independently gives a representative test set while leaving 70% of observations to learn patterns.
+
+The full tree is deliberately grown without pruning and is allowed to become highly tailored to the training sample. It provides a useful high-bias/low-bias comparison: it can capture local patterns but may overfit noise. The pruned tree applies cross-validation and a one-standard-error rule, choosing a simpler tree whose cross-validation error is within one standard error of the minimum. Its simplicity makes the result readable as a set of explicit rules.
+
+Bagging fits 100 bootstrapped tree samples and averages predicted probabilities for each employee. Random forests extend bagging by also sampling predictors at each split, producing more diverse trees and reducing the chance that one strong predictor dominates every tree. Both methods are nonlinear and can model interactions, but both are less transparent than a single pruned tree.
+
+The test-set table reports accuracy, sensitivity, specificity, positive predictive value (PPV), negative predictive value (NPV), and AUC. Accuracy is not the main decision criterion because a benchmark that predicts "No" for every employee would be correct for most employees yet would identify almost no leavers. The ROC plot evaluates ranking performance across thresholds rather than at the arbitrary default of 0.50.
+
+AUC has a case-pair interpretation: it is the probability that a randomly selected employee who left receives a higher estimated probability than a randomly selected employee who stayed. Thus, an AUC of 0.80 would mean that the model ranks the leaver above the retained employee in about 80% of random case pairs. It is not the same as accuracy or a direct estimate of the probability of individual turnover.
+
+
+\pard\b\f0\fs24 Recommendation and Tradeoffs\b0\fs22\par
+The recommended model should be the one that performs best on the test set on the priorities that HR states are most important, not merely the model with the highest accuracy. Because false negatives mean missed employees who actually leave, sensitivity should receive greater attention than specificity. The more common outcome benchmark provides a minimum accuracy standard, but it is unacceptable for a retention program because it produces no proactive identification. If the ensemble has comparable sensitivity and AUC to the pruned tree, the ensemble may be preferred for discrimination; if interpretability is more valuable, the pruned tree should be preferred.
+
+The selected threshold should depend on retention resources. A lower threshold detects more likely leavers but creates more false alerts and extra HR workload. A higher threshold catches fewer leavers but offers higher confidence in the resulting list. A 0.50 threshold is only a neutral starting point and should not be presented as a universal policy. If HR can only review a small number of employees, ranking employees by probability and selecting the highest-risk set may be more practical than imposing a fixed threshold.
+
+
+\pard\b\f0\fs24 Limitations, Fairness, and Next Steps\b0\fs22\par
+The data are observational and the project is one holdout split. The models can identify correlation and ranking but cannot prove cause. Results should be repeated with several random splits or cross-validation to determine whether conclusions survive. The fixed seed makes this run reproducible, but reproducibility is not the same as validation across new organizations or later time periods. A model trained on this company could perform differently at a second company or after organizational change.
+
+Employee attrition data can contain sensitive or legally protected characteristics. Variables such as age, sex, marital status, and disability-related fields should be audited before deployment, and HR should decide whether their use is appropriate. Even if protected variables are omitted, proxies may remain in the data. The model should be paired with an appeal or review process and should not be used to automate employment decisions.
+
+The strongest next step would be to run repeated stratified splits or cross-validation and report uncertainty intervals for AUC and sensitivity. Next, HR should examine false positives and false negatives for meaningful subgroups, compare thresholds under estimated review and turnover costs, and test whether the model remains useful on future hiring cohorts. A causal follow-up, such as a workplace intervention and an experiment or quasi-experimental evaluation, would be needed before claiming that a predictor causes attrition.
+
+\pard\b\f0\fs24 Conclusion\b0\fs22\par
+The project found measurable differences by overtime and early tenure, with a clear need to account for the unequal classes. The full and pruned trees provide interpretable rules, while bagging and random forest may improve ranking by reducing variance. The final choice should be based on test performance, retention needs, and model use. Its role should remain decision support: a tool for human review and targeted organizational improvement, not an automated decision about an employee.
+
+\pard\b\f0\fs20 Interpretation Checklist\b0\fs18\par
+The R Markdown file contains the numerical test-set table and ROC plot used in this report. Those displayed values should be read exactly from the knit output because a random split can alter small differences between models.
+}
